@@ -34,8 +34,8 @@ use {
         gossip_error::GossipError,
         ping_pong::Pong,
         protocol::{
-            split_gossip_messages, Ping, PingCache, Protocol, PruneData,
-            DUPLICATE_SHRED_MAX_PAYLOAD_SIZE, MAX_INCREMENTAL_SNAPSHOT_HASHES,
+            split_gossip_messages, FilterableCrdsDataType, FilterableProtocolType, Ping, PingCache,
+            Protocol, PruneData, DUPLICATE_SHRED_MAX_PAYLOAD_SIZE, MAX_INCREMENTAL_SNAPSHOT_HASHES,
             MAX_PRUNE_DATA_NODES, PULL_RESPONSE_MAX_PAYLOAD_SIZE,
             PULL_RESPONSE_MIN_SERIALIZED_SIZE, PUSH_MESSAGE_MAX_PAYLOAD_SIZE,
         },
@@ -158,7 +158,17 @@ pub struct ClusterInfo {
     contact_save_interval: u64,  // milliseconds, 0 = disabled
     contact_info_path: PathBuf,
     socket_addr_space: SocketAddrSpace,
-    ingress_filter: Arc<RwLock<Arc<dyn Fn(&CrdsData) -> bool + Send + Sync + 'static>>>,
+    // Update the filter signature to accept both Protocol and CrdsValue data
+    ingress_filter: Arc<
+        RwLock<
+            Arc<
+                dyn Fn(FilterableProtocolType, Option<&[FilterableCrdsDataType]>) -> bool
+                    + Send
+                    + Sync
+                    + 'static,
+            >,
+        >,
+    >,
 }
 
 struct PullData {
@@ -229,7 +239,8 @@ impl ClusterInfo {
             contact_info_path: PathBuf::default(),
             contact_save_interval: 0, // disabled
             socket_addr_space,
-            ingress_filter: Arc::new(RwLock::new(Arc::new(|_: &CrdsData| true))),
+            // Initialize with a default filter that accepts both Protocol and CrdsValue data
+            ingress_filter: Arc::new(RwLock::new(Arc::new(|_protocol_type, _data_types| true))),
         };
         me.refresh_my_gossip_contact_info();
         me
@@ -237,7 +248,13 @@ impl ClusterInfo {
 
     pub fn set_ingress_filter(
         &self,
-        filter: Arc<dyn Fn(&CrdsData) -> bool + Send + Sync + 'static>,
+        // Update filter signature to use public enums
+        filter: Arc<
+            dyn Fn(FilterableProtocolType, Option<&[FilterableCrdsDataType]>) -> bool
+                + Send
+                + Sync
+                + 'static,
+        >,
     ) {
         let mut guard = self.ingress_filter.write().unwrap();
         *guard = filter;
@@ -2014,10 +2031,11 @@ impl ClusterInfo {
             })
         };
 
-        // Read the filter ONCE
-        let filter_lock = self.ingress_filter.read().unwrap();
-        let filter_fn = filter_lock.clone();
-        drop(filter_lock);
+        // Read the filter function ONCE
+        let filter_fn = {
+            let filter_lock = self.ingress_filter.read().unwrap();
+            filter_lock.clone()
+        };
 
         // Check if there is a duplicate instance of
         // this node with more recent timestamp.
@@ -2032,7 +2050,7 @@ impl ClusterInfo {
                 }
             }
         };
-        let mut pings = Vec::new();
+        let mut pings_to_verify = Vec::new(); // Renamed from 'pings' to avoid conflict
         let mut rng = rand::thread_rng();
         let keypair: Arc<Keypair> = self.keypair().clone();
         let mut verify_gossip_addr = |value: &CrdsValue| {
@@ -2043,7 +2061,7 @@ impl ClusterInfo {
                 stakes,
                 &self.socket_addr_space,
                 &self.ping_cache,
-                &mut pings,
+                &mut pings_to_verify, // Use renamed vec
             ) {
                 true
             } else {
@@ -2051,26 +2069,92 @@ impl ClusterInfo {
                 false
             }
         };
-        // Split packets based on their types.
+        // Split packets based on their types AFTER filtering.
         let mut pull_requests = vec![];
         let mut pull_responses = vec![];
         let mut push_messages = vec![];
         let mut prune_messages = vec![];
         let mut ping_messages = vec![];
         let mut pong_messages = vec![];
-        for (from_addr, packet) in packets {
-            match packet {
+
+        for (from_addr, protocol) in packets {
+            // --- Convert to public enums and apply ingress filter --- START
+            let (filterable_protocol, maybe_crds_values) = match &protocol {
+                Protocol::PullRequest(_, _) => (FilterableProtocolType::PullRequest, None),
+                Protocol::PullResponse(_, data) => {
+                    (FilterableProtocolType::PullResponse, Some(data))
+                }
+                Protocol::PushMessage(_, data) => (FilterableProtocolType::PushMessage, Some(data)),
+                Protocol::PruneMessage(_, _) => (FilterableProtocolType::PruneMessage, None),
+                Protocol::PingMessage(_) => (FilterableProtocolType::PingMessage, None),
+                Protocol::PongMessage(_) => (FilterableProtocolType::PongMessage, None),
+            };
+
+            // Allocate Vec only if needed
+            let filterable_data_types_vec: Option<Vec<FilterableCrdsDataType>> = maybe_crds_values
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| match value.data() {
+                            // Access internal data() here
+                            // Use fully qualified path to private enum
+                            crate::crds_data::CrdsData::ContactInfo(_) => {
+                                FilterableCrdsDataType::ContactInfo
+                            }
+                            crate::crds_data::CrdsData::Vote(..) => FilterableCrdsDataType::Vote,
+                            crate::crds_data::CrdsData::LowestSlot(..) => {
+                                FilterableCrdsDataType::LowestSlot
+                            }
+                            crate::crds_data::CrdsData::SnapshotHashes(_) => {
+                                FilterableCrdsDataType::SnapshotHashes
+                            }
+                            crate::crds_data::CrdsData::EpochSlots(..) => {
+                                FilterableCrdsDataType::EpochSlots
+                            }
+                            crate::crds_data::CrdsData::DuplicateShred(..) => {
+                                FilterableCrdsDataType::DuplicateShred
+                            }
+                            crate::crds_data::CrdsData::RestartLastVotedForkSlots(..) => {
+                                FilterableCrdsDataType::RestartLastVotedForkSlots
+                            }
+                            crate::crds_data::CrdsData::RestartHeaviestFork(..) => {
+                                FilterableCrdsDataType::RestartHeaviestFork
+                            }
+                            crate::crds_data::CrdsData::Version(_) => {
+                                FilterableCrdsDataType::Version
+                            }
+                            crate::crds_data::CrdsData::NodeInstance(_) => {
+                                FilterableCrdsDataType::NodeInstance
+                            }
+                            _ => FilterableCrdsDataType::Other, // Catch-all for legacy/uninteresting types
+                        })
+                        .collect()
+                });
+
+            // Pass Option<&[FilterableCrdsDataType]> by taking a slice of the Vec
+            let passes = filter_fn(filterable_protocol, filterable_data_types_vec.as_deref());
+
+            if !passes {
+                self.stats.ingress_filtered_count.add_relaxed(1);
+                continue; // Skip processing this packet
+            }
+            // --- Convert to public enums and apply ingress filter --- END
+
+            // Packet passed filter, proceed with checks and sorting
+            match protocol {
                 Protocol::PullRequest(filter, caller) => {
                     if verify_gossip_addr(&caller) {
-                        pull_requests.push((from_addr, filter, caller))
+                        pull_requests.push((from_addr, filter, caller));
                     }
                 }
                 Protocol::PullResponse(_, mut data) => {
+                    // Note: 'from' pubkey is now unused here
                     if should_check_duplicate_instance {
                         check_duplicate_instance(&data)?;
                     }
-                    data.retain(&mut verify_gossip_addr);
+                    data.retain(&mut verify_gossip_addr); // Check sender liveness
                     if !data.is_empty() {
+                        // Add the *original* CrdsValue data, not the converted enums
                         pull_responses.append(&mut data);
                     }
                 }
@@ -2078,28 +2162,25 @@ impl ClusterInfo {
                     if should_check_duplicate_instance {
                         check_duplicate_instance(&data)?;
                     }
-                    // Apply filter first, then shadowing closure (1-arg) within retain
-                    data.retain(|value| {
-                        let passes_filter = filter_fn(value.data());
-                        if !passes_filter {
-                            self.stats.ingress_filtered_count.add_relaxed(1);
-                            return false;
-                        }
-                        verify_gossip_addr(value) // Calls 1-arg shadowing closure
-                    });
+                    data.retain(&mut verify_gossip_addr); // Check sender liveness
                     if !data.is_empty() {
+                        // Add the *original* CrdsValue data
                         push_messages.push((from, data));
                     }
                 }
-                Protocol::PruneMessage(_from, data) => prune_messages.push(data),
+                Protocol::PruneMessage(_from, data) => prune_messages.push(data), // 'from' pubkey unused here
                 Protocol::PingMessage(ping) => ping_messages.push((from_addr, ping)),
                 Protocol::PongMessage(pong) => pong_messages.push((from_addr, pong)),
             }
         }
-        let pings = pings
+
+        // Send pings generated by verify_gossip_addr
+        let pings_to_send = pings_to_verify
             .into_iter()
             .map(|(addr, ping)| (addr, Protocol::PingMessage(ping)));
-        send_gossip_packets(pings, recycler, response_sender, &self.stats);
+        send_gossip_packets(pings_to_send, recycler, response_sender, &self.stats);
+
+        // Handle batches
         self.handle_batch_ping_messages(ping_messages, recycler, response_sender);
         self.handle_batch_prune_messages(prune_messages, stakes);
         self.handle_batch_push_messages(
@@ -2934,23 +3015,35 @@ fn filter_on_shred_version(
         // * their propagation across cluster is expedited.
         // * prevent two running instances of the same identity key cross
         //   contaminate gossip between clusters.
-        if crds.get_shred_version(from) == Some(self_shred_version) {
-            values.retain(|value| match value.data() {
-                // Allow contact-infos so that shred-versions are updated.
-                CrdsData::ContactInfo(_) => true,
-                CrdsData::LegacyContactInfo(_) => true,
-                CrdsData::NodeInstance(_) => true,
-                // Only retain values with the same shred version.
-                _ => crds.get_shred_version(&value.pubkey()) == Some(self_shred_version),
+        let from_shred_version = crds.get_shred_version(from); // Get sender's shred version once
+        if from_shred_version == Some(self_shred_version) {
+            values.retain(|value| {
+                let retain = match value.data() {
+                    // Allow contact-infos so that shred-versions are updated.
+                    CrdsData::ContactInfo(_) => true,
+                    CrdsData::LegacyContactInfo(_) => true,
+                    CrdsData::NodeInstance(_) => true,
+                    // Only retain values with the same shred version.
+                    _ => {
+                        let value_pubkey = value.pubkey();
+                        let value_shred_version = crds.get_shred_version(&value_pubkey);
+                        let matches = value_shred_version == Some(self_shred_version);
+                        matches
+                    }
+                };
+                retain
             })
         } else {
-            values.retain(|value| match value.data() {
-                // Allow node to update its own contact info in case their
-                // shred-version changes
-                CrdsData::ContactInfo(node) => node.pubkey() == from,
-                CrdsData::LegacyContactInfo(node) => node.pubkey() == from,
-                CrdsData::NodeInstance(_) => true,
-                _ => false,
+            values.retain(|value| {
+                let retain = match value.data() {
+                    // Allow node to update its own contact info in case their
+                    // shred-version changes
+                    CrdsData::ContactInfo(node) => node.pubkey() == from,
+                    CrdsData::LegacyContactInfo(node) => node.pubkey() == from,
+                    CrdsData::NodeInstance(_) => true,
+                    _ => false,
+                };
+                retain
             })
         }
         let num_skipped = num_values - values.len();

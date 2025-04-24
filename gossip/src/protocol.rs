@@ -80,6 +80,35 @@ pub(crate) struct PruneData {
     pub(crate) wallclock: u64,
 }
 
+/// Public representation of Gossip protocol message types for filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterableProtocolType {
+    PullRequest,
+    PullResponse,
+    PushMessage,
+    PruneMessage,
+    PingMessage,
+    PongMessage,
+}
+
+/// Public representation of CrdsData types for filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterableCrdsDataType {
+    ContactInfo,
+    Vote,
+    LowestSlot,
+    SnapshotHashes,
+    EpochSlots,
+    DuplicateShred,
+    RestartLastVotedForkSlots,
+    RestartHeaviestFork,
+    // Explicitly list types that might be interesting to filter/count
+    Version,
+    NodeInstance,
+    // Catch-all for others (AccountsHashes, Legacy types)
+    Other,
+}
+
 impl Protocol {
     /// Returns the bincode serialized size (in bytes) of the Protocol.
     #[cfg(test)]
